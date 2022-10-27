@@ -1,5 +1,5 @@
-use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::cursor;
+use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::{execute, queue};
@@ -22,6 +22,7 @@ struct UserInput {
     input: String,
     cursor: usize,
     indices: Vec<usize>,
+    word_split: &'static str,
 }
 
 impl UserInput {
@@ -30,6 +31,7 @@ impl UserInput {
             input: String::with_capacity(256),
             cursor: 0,
             indices: Vec::with_capacity(256),
+            word_split: " \t/",
         }
     }
 
@@ -39,6 +41,10 @@ impl UserInput {
 
     pub fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    pub fn nth(&self, index: usize) -> Option<char> {
+        self.input.chars().nth(index)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -94,6 +100,59 @@ impl UserInput {
             self.cursor = min(self.len(), self.cursor + offset.unsigned_abs());
         }
     }
+
+    pub fn move_to_begin(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn move_to_end(&mut self) {
+        self.cursor = self.len();
+    }
+
+    pub fn move_to_prev_word(&mut self) {
+        // Skip the whitespace at the current position.
+        self.cursor = self.cursor.saturating_sub(1);
+
+        while self.cursor > 0 {
+            if let Some(next_ch) = self.nth(self.cursor.saturating_sub(1)) {
+                if let Some(ch) = self.nth(self.cursor) {
+                    if self.word_split.contains(next_ch) && !self.word_split.contains(ch) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+
+            self.cursor -= 1;
+        }
+    }
+
+    pub fn move_to_next_word(&mut self) {
+        // Skip the whitespace at the current position.
+        self.cursor += 1;
+        if self.cursor > self.input.len() {
+            self.cursor = self.input.len();
+        }
+
+        while self.cursor < self.input.len() {
+            if let Some(prev_ch) = self.nth(self.cursor.saturating_sub(1)) {
+                if let Some(ch) = self.nth(self.cursor) {
+                    if self.word_split.contains(prev_ch) && !self.word_split.contains(ch) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+
+            self.cursor += 1;
+        }
+    }
 }
 
 impl Drop for SmashState {
@@ -105,9 +164,9 @@ impl Drop for SmashState {
 impl SmashState {
     pub fn new() -> Self {
         Self {
+            columns: 0,
             lines: 0,
             prompt_len: 0,
-            columns: 0,
             input: UserInput::new(),
             clear_above: 0,
             clear_below: 0,
@@ -138,7 +197,7 @@ impl SmashState {
 
         let (mut prompt_str, mut prompt_len) = (String::new(), 0);
         prompt_str.push_str(" $ ");
-        queue!(stdout, Print(prompt_str.replace("\n", "\r\n"))).ok();
+        queue!(stdout, Print(prompt_str.replace('\n', "\r\n"))).ok();
         prompt_len += prompt_str.len();
         stdout.flush().unwrap();
 
@@ -146,6 +205,10 @@ impl SmashState {
     }
 
     fn print_user_input(&mut self) {
+        if cfg!(test) {
+            return;
+        }
+
         let mut stdout = std::io::stdout();
 
         queue!(stdout, cursor::Hide).ok();
@@ -155,7 +218,7 @@ impl SmashState {
             Print("\r"),
             cursor::MoveRight(self.prompt_len as u16),
             Clear(ClearType::UntilNewLine),
-            Print(self.input.input.replace("\n", "\r\n"))
+            Print(self.input.input.replace('\n', "\r\n"))
         )
             .ok();
 
@@ -200,6 +263,18 @@ impl SmashState {
                 } else {
                     self.input.delete();
                 }
+            }
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                self.input.move_to_begin();
+            }
+            (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                self.input.move_to_end();
+            }
+            (KeyCode::Char('f'), KeyModifiers::ALT) => {
+                self.input.move_to_next_word();
+            }
+            (KeyCode::Char('b'), KeyModifiers::ALT) => {
+                self.input.move_to_prev_word();
             }
             (KeyCode::Left, KeyModifiers::NONE) => {
                 self.input.move_by(-1);
@@ -250,5 +325,100 @@ impl SmashState {
                 _ => (),
             }
         }
+    }
+
+    #[cfg(test)]
+    fn input_str(&mut self, string: &str) {
+        for ch in string.chars() {
+            let code = match ch {
+                '\n' => KeyCode::Enter,
+                '\t' => KeyCode::Tab,
+                _ => KeyCode::Char(ch),
+            };
+
+            self.handle_key_event(&KeyEvent::new(code, KeyModifiers::NONE));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn create_smash_state() -> SmashState {
+        SmashState::new()
+    }
+
+    macro_rules! key_event {
+        ($key:expr, $modifiers:expr) => {
+            KeyEvent::new($key, $modifiers)
+        };
+    }
+
+    #[test]
+    fn move_by() {
+        let mut m = create_smash_state();
+        assert_eq!(m.input.cursor(), 0);
+        m.handle_key_event(&key_event!(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(m.input.cursor(), 0);
+        m.handle_key_event(&key_event!(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(m.input.cursor(), 0);
+
+        m.input_str("abc x  123");
+        assert_eq!(m.input.cursor(), 10);
+        m.handle_key_event(&key_event!(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(m.input.cursor(), 9);
+        m.handle_key_event(&key_event!(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(m.input.cursor(), 8);
+        m.handle_key_event(&key_event!(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(m.input.cursor(), 7);
+        m.handle_key_event(&key_event!(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(m.input.cursor(), 8);
+        m.handle_key_event(&key_event!(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(m.input.cursor(), 9);
+        m.handle_key_event(&key_event!(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(m.input.cursor(), 10);
+
+        m.input.clear();
+        m.input_str("     ");
+        m.handle_key_event(&key_event!(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(m.input.cursor(), 5);
+        m.handle_key_event(&key_event!(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(m.input.cursor(), 4);
+    }
+
+    #[test]
+    fn move_by_word() {
+        let mut m = create_smash_state();
+        assert_eq!(m.input.cursor(), 0);
+        m.handle_key_event(&key_event!(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(m.input.cursor(), 0);
+        m.handle_key_event(&key_event!(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert_eq!(m.input.cursor(), 0);
+
+        m.input_str("abc x  123");
+        assert_eq!(m.input.cursor(), 10);
+        m.handle_key_event(&key_event!(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(m.input.cursor(), 7);
+        m.handle_key_event(&key_event!(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(m.input.cursor(), 4);
+        m.handle_key_event(&key_event!(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(m.input.cursor(), 0);
+        m.handle_key_event(&key_event!(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(m.input.cursor(), 0);
+        m.handle_key_event(&key_event!(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert_eq!(m.input.cursor(), 4);
+        m.handle_key_event(&key_event!(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert_eq!(m.input.cursor(), 7);
+        m.handle_key_event(&key_event!(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert_eq!(m.input.cursor(), 10);
+
+        m.input.clear();
+        m.input_str("     ");
+        m.handle_key_event(&key_event!(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert_eq!(m.input.cursor(), 5);
+        m.handle_key_event(&key_event!(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(m.input.cursor(), 0);
     }
 }
